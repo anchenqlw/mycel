@@ -1,0 +1,4 @@
+interface:
+  display_name: "Production Graph Brainstorm"
+  short_description: "Clarify and design human-agent production graphs"
+  default_prompt: "Use $production-graph-brainstorm to clarify and design this production graph before deployment."

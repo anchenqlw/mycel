@@ -1,0 +1,12 @@
+{
+  "name": "@mycel/channel-feishu",
+  "version": "0.1.0",
+  "type": "module",
+  "main": "src/index.ts",
+  "types": "src/index.ts",
+  "dependencies": {
+    "@larksuiteoapi/node-sdk": "^1.70.0",
+    "@mycel/application": "0.1.0",
+    "@mycel/domain": "0.1.0"
+  }
+}

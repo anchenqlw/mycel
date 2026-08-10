@@ -1,0 +1,16 @@
+{
+  "name": "@mycel/server",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "dependencies": {
+    "@mycel/application": "0.1.0",
+    "@mycel/channel-dingtalk": "0.1.0",
+    "@mycel/channel-feishu": "0.1.0",
+    "@mycel/domain": "0.1.0",
+    "@mycel/executor-claude-code": "0.1.0",
+    "@mycel/ledger-sqlite": "0.1.0",
+    "@mycel/steward-claude": "0.1.0",
+    "qrcode": "^1.5.4"
+  }
+}

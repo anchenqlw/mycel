@@ -1,0 +1,11 @@
+{
+  "name": "@mycel/flow-engine",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "exports": "./src/index.ts",
+  "dependencies": {
+    "@mycel/domain": "0.1.0",
+    "ulid": "^3.0.1"
+  }
+}

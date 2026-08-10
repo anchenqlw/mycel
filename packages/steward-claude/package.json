@@ -1,0 +1,13 @@
+{
+  "name": "@mycel/steward-claude",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "exports": "./src/index.ts",
+  "dependencies": {
+    "@mycel/application": "0.1.0",
+    "@mycel/domain": "0.1.0",
+    "@mycel/executor-claude-code": "0.1.0",
+    "zod": "^4.0.14"
+  }
+}
