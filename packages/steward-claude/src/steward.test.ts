@@ -40,5 +40,7 @@ describe("stewardPrompt", () => {
     expect(prompt).toContain("Recent conversation");
     expect(prompt).toContain("Local IANA timezone: Asia/Shanghai");
     expect(prompt).toContain("use the provided Local IANA timezone without asking");
+    expect(prompt).toContain("Never emit Flow id, status, version, createdAt, or updatedAt");
+    expect(prompt).toContain("flowRef:<create operation ID>");
   });
 });

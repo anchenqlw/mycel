@@ -84,7 +84,7 @@ export interface FlowBudget {
 
 export type FlowTrigger =
   | { kind: "manual" }
-  | { kind: "schedule"; intervalMs: number }
+  | { kind: "schedule"; intervalMs: number; timeOfDay?: string; timezone?: string }
   | { kind: "graph-event"; eventType: string }
   | { kind: "file-change"; glob: string }
   | { kind: "webhook"; key: string };

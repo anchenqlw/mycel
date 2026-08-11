@@ -7,7 +7,7 @@ import type {
   HumanTask,
 } from "@mycel/domain";
 import { describe, expect, it } from "vitest";
-import { LocalFlowEngine, type AgentStepInput, type FlowEnginePort } from "./flow-engine.js";
+import { LocalFlowEngine, nextScheduleOccurrence, type AgentStepInput, type FlowEnginePort } from "./flow-engine.js";
 
 class FakePort implements FlowEnginePort {
   definitions: FlowDefinition[] = [];
@@ -77,6 +77,50 @@ function step(
 }
 
 describe("LocalFlowEngine collaboration runtime", () => {
+  it("calculates the next zoned wall-clock schedule across today, tomorrow, and DST", () => {
+    const shanghai = { kind: "schedule" as const, intervalMs: 86_400_000, timeOfDay: "08:30", timezone: "Asia/Shanghai" };
+    expect(nextScheduleOccurrence(shanghai, new Date("2026-08-10T00:00:00.000Z")).toISOString()).toBe("2026-08-10T00:30:00.000Z");
+    expect(nextScheduleOccurrence(shanghai, new Date("2026-08-10T01:00:00.000Z")).toISOString()).toBe("2026-08-11T00:30:00.000Z");
+
+    expect(nextScheduleOccurrence(
+      { kind: "schedule", intervalMs: 86_400_000, timeOfDay: "08:30", timezone: "America/New_York" },
+      new Date("2026-03-08T06:00:00.000Z"),
+    ).toISOString()).toBe("2026-03-08T12:30:00.000Z");
+  });
+
+  it("rejects invalid wall-clock schedules without changing the process timezone", () => {
+    expect(() => nextScheduleOccurrence(
+      { kind: "schedule", intervalMs: 86_400_000, timeOfDay: "25:90", timezone: "Asia/Shanghai" },
+      new Date("2026-08-10T00:00:00.000Z"),
+    )).toThrow(/timeOfDay/i);
+    expect(() => nextScheduleOccurrence(
+      { kind: "schedule", intervalMs: 86_400_000, timeOfDay: "08:30", timezone: "Mars/Olympus" },
+      new Date("2026-08-10T00:00:00.000Z"),
+    )).toThrow(/timezone/i);
+    expect(() => nextScheduleOccurrence(
+      { kind: "schedule", intervalMs: 7 * 86_400_000, timeOfDay: "08:30", timezone: "Asia/Shanghai" },
+      new Date("2026-08-10T00:00:00.000Z"),
+    )).toThrow(/daily/i);
+  });
+
+  it("skips a nonexistent DST wall-clock instant and schedules the next valid day", () => {
+    expect(nextScheduleOccurrence(
+      { kind: "schedule", intervalMs: 86_400_000, timeOfDay: "02:30", timezone: "America/New_York" },
+      new Date("2026-03-08T06:00:00.000Z"),
+    ).toISOString()).toBe("2026-03-09T06:30:00.000Z");
+  });
+
+  it("does not retain or schedule a Flow when persistence fails", async () => {
+    const port = new FakePort();
+    port.persistDefinition = async () => { throw new Error("ledger unavailable"); };
+    const engine = new LocalFlowEngine(port);
+
+    await expect(engine.save(draft([step("inspect")]))).rejects.toThrow(/ledger unavailable/);
+
+    expect(engine.list()).toEqual([]);
+    await expect(engine.publish("flow:test")).rejects.toThrow(/not found/i);
+  });
+
   it("uses an injected clock for persisted flow timestamps", async () => {
     let now = "2027-04-20T14:30:00.000Z";
     const port = new FakePort();

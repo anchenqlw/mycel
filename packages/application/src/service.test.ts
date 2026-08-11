@@ -1,4 +1,4 @@
-import type { ChangeSet, ControlCommand, ExecutionContract, HarnessIntent, StewardResult, WeaveDiff } from "@mycel/domain";
+import type { ChangeSet, ControlCommand, ExecutionContract, FlowDefinition, HarnessIntent, StewardResult, WeaveDiff } from "@mycel/domain";
 import { SqliteEventStore } from "@mycel/ledger-sqlite";
 import { describe, expect, it } from "vitest";
 import type { ExecutorPort, StewardPort } from "./ports.js";
@@ -139,6 +139,60 @@ class CancellableExecutor implements ExecutorPort {
 }
 
 describe("ApplicationService", () => {
+  it("records a Flow definition and its derived Graph facts in one event", async () => {
+    const store = new SqliteEventStore(":memory:", emptyProjection(), reduceProjection);
+    const service = new ApplicationService(store, new FakeSteward(), new FakeExecutor(), {
+      repositoryId: "repo:demo",
+      executorActorId: "agent:claude",
+      ownerActorId: "human:owner",
+      stewardActorId: "agent:steward",
+      testCommandId: "test:npm",
+      testCommandArgv: ["npm", "test"],
+    });
+    await service.initialize();
+    const before = store.readAll().length;
+    const flow: FlowDefinition = {
+      id: "flow:atomic",
+      name: "Atomic Flow",
+      description: "One fact boundary",
+      status: "draft",
+      version: 0,
+      trigger: { kind: "manual" },
+      steps: [],
+      permissionCeiling: [],
+      createdAt: "2026-08-10T12:00:00.000Z",
+      updatedAt: "2026-08-10T12:00:00.000Z",
+    };
+
+    service.recordFlowDefinition(flow);
+
+    expect(store.readAll()).toHaveLength(before + 1);
+    expect(service.getProjection().flows[flow.id]).toEqual(flow);
+    expect(service.getProjection().graph.nodes).toContainEqual(expect.objectContaining({ id: "work:flow:flow:atomic" }));
+    store.close();
+  });
+
+  it("leaves both Flow and Graph unchanged when the atomic projection is rejected", async () => {
+    const store = new SqliteEventStore(":memory:", emptyProjection(), reduceProjection);
+    const service = new ApplicationService(store, new FakeSteward(), new FakeExecutor(), {
+      repositoryId: "repo:demo", executorActorId: "agent:claude", ownerActorId: "human:owner", stewardActorId: "agent:steward", testCommandId: "test:npm", testCommandArgv: ["npm", "test"],
+    });
+    await service.initialize();
+    const beforeEvents = store.readAll().length;
+    const beforeGraph = structuredClone(service.getProjection().graph);
+    const invalid: FlowDefinition = {
+      id: "flow:invalid-atomic", name: "Invalid atomic Flow", description: "Must roll back", status: "published", version: 1,
+      trigger: { kind: "manual" }, permissionCeiling: [], createdAt: "2026-08-10T12:00:00.000Z", updatedAt: "2026-08-10T12:00:00.000Z",
+      steps: [{ id: "review", name: "Review", kind: "human", actorId: "human:owner", prompt: "Review", dependsOn: ["missing"], condition: "previous-succeeded", timeoutMs: 60_000, maxAttempts: 1 }],
+    };
+
+    expect(() => service.recordFlowDefinition(invalid)).toThrow();
+    expect(store.readAll()).toHaveLength(beforeEvents);
+    expect(service.getProjection().flows[invalid.id]).toBeUndefined();
+    expect(service.getProjection().graph).toEqual(beforeGraph);
+    store.close();
+  });
+
   it("runs the red approval, execution evidence, and human acceptance loop exactly once", async () => {
     const store = new SqliteEventStore(":memory:", emptyProjection(), reduceProjection);
     const executor = new FakeExecutor();
@@ -384,6 +438,71 @@ describe("ApplicationService", () => {
     if (result.kind !== "changeset") throw new Error("expected ChangeSet");
     expect(result.changeSet).toMatchObject({ aggregateRisk: "red", status: "awaiting-approval" });
     expect(result.block.changeSetId).toBe(result.changeSet.id);
+    store.close();
+  });
+
+  it("turns a malformed ChangeSet into one safe clarification instead of a request failure", async () => {
+    const store = new SqliteEventStore(":memory:", emptyProjection(), reduceProjection);
+    const steward: StewardPort = {
+      respond: async () => ({
+        kind: "changeset", text: "待审批变更", reasoningSummary: "需要持久化变更。",
+        changeSet: { title: "无效流程", intentSummary: "创建流程", operations: [{ id: "create", kind: "create-flow", dependsOn: [], payload: { description: "missing fields" } }], preconditions: [] },
+      }),
+      repair: async () => { throw new Error("repair model temporarily unavailable"); },
+    };
+    const service = new ApplicationService(store, steward, new FakeExecutor(), { repositoryId: "repo:demo", executorActorId: "agent:claude", ownerActorId: "human:owner", stewardActorId: "agent:steward", testCommandId: "test:npm", testCommandArgv: ["npm", "test"] });
+    await service.initialize();
+    service.setStewardControlPlane(new ControlPlane(store, {
+      executeCommand: async () => ({}),
+      applyChange: async () => ({}),
+      validateChange: async () => { throw new Error("create-flow payload contains a private absolute path and invalid fields"); },
+    }));
+
+    const result = await service.submitIntent({ messageId: "message-invalid-changeset", channel: "web", conversationId: "web:owner", actorId: "human:owner", text: "创建流程" });
+
+    expect(result.kind).toBe("clarification");
+    expect(store.readAll().filter((event) => event.eventType === "ChangeSetEvent")).toHaveLength(0);
+    expect(JSON.stringify(result)).not.toContain("private absolute path");
+    expect(JSON.stringify(result)).not.toContain("repair model temporarily unavailable");
+    store.close();
+  });
+
+  it("does not misclassify ChangeSet persistence failures as repairable validation", async () => {
+    const store = new SqliteEventStore(":memory:", emptyProjection(), reduceProjection);
+    const service = new ApplicationService(store, new StaticSteward({
+      kind: "changeset", text: "待审批变更", reasoningSummary: "持久化流程。",
+      changeSet: { title: "流程", intentSummary: "创建流程", operations: [{ id: "create", kind: "create-flow", dependsOn: [], payload: { name: "Valid", steps: [{ id: "review", name: "Review", actorId: "agent:claude" }] } }], preconditions: [] },
+    }), new FakeExecutor(), { repositoryId: "repo:demo", executorActorId: "agent:claude", ownerActorId: "human:owner", stewardActorId: "agent:steward", testCommandId: "test:npm", testCommandArgv: ["npm", "test"] });
+    await service.initialize();
+    service.setStewardControlPlane({
+      executeCommand: async (command) => command,
+      proposeChangeSet: async () => { throw new Error("ledger unavailable"); },
+    });
+
+    await expect(service.submitIntent({ messageId: "message-ledger-failure", channel: "web", conversationId: "web:owner", actorId: "human:owner", text: "创建流程" })).rejects.toThrow(/ledger unavailable/i);
+    store.close();
+  });
+
+  it("repairs an invalid ChangeSet once before presenting an approvable card", async () => {
+    const store = new SqliteEventStore(":memory:", emptyProjection(), reduceProjection);
+    const steward: StewardPort = {
+      respond: async () => ({ kind: "changeset", text: "初始变更", reasoningSummary: "持久化流程。", changeSet: { title: "流程", intentSummary: "创建流程", operations: [{ id: "invalid", kind: "create-flow", dependsOn: [], payload: { name: "Invalid", steps: [{ id: "review", name: "Review", actorId: "missing" }] } }], preconditions: [] } }),
+      repair: async () => ({ kind: "changeset", text: "已修正资源引用。", reasoningSummary: "使用已注册 Actor。", changeSet: { title: "流程", intentSummary: "创建流程", operations: [{ id: "valid", kind: "create-flow", dependsOn: [], payload: { name: "Valid", steps: [{ id: "review", name: "Review", actorId: "agent:claude" }] } }], preconditions: [] } }),
+    };
+    const service = new ApplicationService(store, steward, new FakeExecutor(), { repositoryId: "repo:demo", executorActorId: "agent:claude", ownerActorId: "human:owner", stewardActorId: "agent:steward", testCommandId: "test:npm", testCommandArgv: ["npm", "test"] });
+    await service.initialize();
+    service.setStewardControlPlane(new ControlPlane(store, {
+      executeCommand: async () => ({}), applyChange: async () => ({}),
+      validateChange: async (operation) => { if (operation.id === "invalid") throw new Error("unknown absolute resource path"); },
+    }));
+
+    const result = await service.submitIntent({ messageId: "message-repaired-changeset", channel: "web", conversationId: "web:owner", actorId: "human:owner", text: "创建流程" });
+
+    expect(result.kind).toBe("changeset");
+    if (result.kind !== "changeset") throw new Error("expected ChangeSet");
+    expect(result.changeSet.operations[0]?.id).toBe("valid");
+    expect(result.block.text).toBe("已修正资源引用。");
+    expect(JSON.stringify(result)).not.toContain("absolute resource path");
     store.close();
   });
 

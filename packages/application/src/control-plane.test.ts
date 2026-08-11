@@ -74,6 +74,24 @@ describe("unified Control Plane", () => {
     expect(changeCalls).toBe(1);
   });
 
+  it("rejects an invalid operation before persisting a ChangeSet proposal", async () => {
+    const store = new SqliteEventStore(":memory:", emptyProjection(), reduceProjection);
+    const plane = new ControlPlane(store, {
+      executeCommand: async () => ({}),
+      applyChange: async () => ({}),
+      validateChange: async (operation) => {
+        if (operation.kind === "create-flow") throw new Error("create-flow name is required");
+      },
+    });
+
+    await expect(plane.proposeChangeSet(changeSet({
+      id: "changeset:invalid",
+      idempotencyKey: "changeset:invalid",
+      operations: [{ id: "create", kind: "create-flow", dependsOn: [], payload: { description: "missing name" } }],
+    }))).rejects.toThrow(/validation failed/i);
+    expect(store.readAll()).toEqual([]);
+  });
+
   it("uses an injected clock for command state and ledger events", async () => {
     const fixedTime = "2027-04-20T14:30:00.000Z";
     const store = new SqliteEventStore(":memory:", emptyProjection(), reduceProjection);

@@ -1,5 +1,6 @@
 import { describe, expect, it } from "vitest";
 import {
+  ChangeOperationSchema,
   DomainInvariantError,
   applyOperations,
   assertGraphInvariants,
@@ -74,6 +75,54 @@ describe("risk classification", () => {
     const result = classifyDiff(diff());
     expect(result.operations).toEqual({ "op-work": "green", "op-executor": "yellow", "op-auth": "red" });
     expect(result.aggregate).toBe("red");
+  });
+});
+
+describe("ChangeOperation payload contracts", () => {
+  it("rejects a create-flow draft that cannot be materialized", () => {
+    const result = ChangeOperationSchema.safeParse({
+      id: "op-create-flow",
+      kind: "create-flow",
+      dependsOn: [],
+      payload: { description: "missing the required flow name" },
+    });
+
+    expect(result.success).toBe(false);
+  });
+
+  it("accepts a plan-shaped create-flow while leaving host-owned fields optional", () => {
+    const result = ChangeOperationSchema.safeParse({
+      id: "op-create-flow",
+      kind: "create-flow",
+      dependsOn: [],
+      payload: {
+        name: "Daily repository review",
+        workspaceId: "workspace:demo",
+        trigger: { kind: "schedule", intervalMs: 86_400_000, timeOfDay: "08:30", timezone: "Asia/Shanghai" },
+        steps: [{ id: "review", name: "Review changes", kind: "agent", actorId: "worker:reviewer", dependsOn: [] }],
+      },
+    });
+
+    expect(result.success).toBe(true);
+  });
+
+  it("accepts graph-node drafts without ids and rejects host-owned fields in Flow patches", () => {
+    expect(ChangeOperationSchema.safeParse({
+      id: "create-capability", kind: "create-graph-node", dependsOn: [],
+      payload: { name: "Repository read", type: "capability", kind: "repository-read", scope: "workspace:demo", constraints: {} },
+    }).success).toBe(true);
+
+    expect(ChangeOperationSchema.safeParse({
+      id: "update-flow", kind: "update-flow", targetId: "flow:daily", dependsOn: [],
+      payload: { patch: { id: "flow:other", status: "published", description: "unsafe" } },
+    }).success).toBe(false);
+  });
+
+  it("rejects invalid nested Flow step fields instead of accepting raw payload data", () => {
+    expect(ChangeOperationSchema.safeParse({
+      id: "create-flow", kind: "create-flow", dependsOn: [],
+      payload: { name: "Unsafe", steps: [{ id: "review", name: "Review", actorId: "agent:claude", join: { mode: "bogus" }, requiredCapabilities: [1] }] },
+    }).success).toBe(false);
   });
 });
 

@@ -8,7 +8,15 @@ import { resourcesOfKind } from "./resource-resolver.js";
 export interface ControlPlaneHandlers {
   executeCommand(command: ControlCommand): Promise<unknown>;
   applyChange(operation: ChangeOperation, changeSet: ChangeSet, appliedResults: Readonly<Record<string, unknown>>): Promise<unknown>;
+  validateChange?(operation: ChangeOperation, changeSet: ChangeSet): Promise<void> | void;
   resolveResource?(resource: ControlResourceReference): Promise<ControlResourceReference | undefined>;
+}
+
+export class ChangeSetValidationError extends Error {
+  constructor() {
+    super("ChangeSet validation failed");
+    this.name = "ChangeSetValidationError";
+  }
 }
 
 export class ControlPlane {
@@ -51,8 +59,13 @@ export class ControlPlane {
       if (existing.idempotencyKey !== input.idempotencyKey) throw new Error(`ChangeSet ID conflict: ${input.id}`);
       return existing;
     }
-    orderChangeOperations(input.operations);
-    await this.#assertPreconditions(input);
+    try {
+      orderChangeOperations(input.operations);
+      for (const operation of input.operations) await this.#handlers.validateChange?.(operation, input);
+      await this.#assertPreconditions(input);
+    } catch {
+      throw new ChangeSetValidationError();
+    }
     const aggregateRisk = classifyChangeSetRisk(input.operations);
     const changeSet: ChangeSet = {
       ...input,

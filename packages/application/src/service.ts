@@ -38,6 +38,7 @@ import type {
 import { NoopNotifier, systemClock } from "./ports.js";
 import type { AppProjection, MutationView, RunView, StewardResponseView } from "./projection.js";
 import { compileProductionPlan, proposalId, validateProductionPlan } from "./production-plan.js";
+import { ChangeSetValidationError } from "./control-plane.js";
 
 export interface ApplicationConfig {
   repositoryId: string;
@@ -319,16 +320,41 @@ export class ApplicationService {
 
     if (decision.kind === "changeset") {
       if (!this.#stewardControl) throw new Error("Steward Control Plane is not configured");
-      const now = this.#now();
-      const draft: ChangeSet = {
-        schemaVersion: 1, id: `changeset_${ulid()}`, title: decision.changeSet.title, intentSummary: decision.changeSet.intentSummary,
-        operations: decision.changeSet.operations, preconditions: decision.changeSet.preconditions,
-        impact: { resourcesCreated: [], resourcesModified: [], resourcesArchived: [], permissionsAdded: [], runtimeEffects: [], warnings: [] },
-        aggregateRisk: "green", status: "draft", operationResults: [], contextVersion: projection.graph.version,
-        initiatedBy: input.actorId, sourceMessageId: input.messageId, idempotencyKey: `steward-changeset:${input.channel}:${input.messageId}`, createdAt: now, updatedAt: now,
+      const diagnostics = [{ code: "invalid-changeset", path: "changeSet.operations", message: "变更结构或资源引用还不完整" }];
+      const propose = async (candidate: Extract<HarnessIntent, { kind: "changeset" }>): Promise<ChangeSet> => {
+        const proposedAt = this.#now();
+        return this.#stewardControl!.proposeChangeSet({
+          schemaVersion: 1, id: `changeset_${ulid()}`, title: candidate.changeSet.title, intentSummary: candidate.changeSet.intentSummary,
+          operations: candidate.changeSet.operations, preconditions: candidate.changeSet.preconditions,
+          impact: { resourcesCreated: [], resourcesModified: [], resourcesArchived: [], permissionsAdded: [], runtimeEffects: [], warnings: [] },
+          aggregateRisk: "green", status: "draft", operationResults: [], contextVersion: projection.graph.version,
+          initiatedBy: input.actorId, sourceMessageId: input.messageId, idempotencyKey: `steward-changeset:${input.channel}:${input.messageId}`, createdAt: proposedAt, updatedAt: proposedAt,
+        });
       };
-      const changeSet = await this.#stewardControl.proposeChangeSet(draft);
-      const block: ConversationBlock = { id: `block_${ulid()}`, conversationId: input.conversationId, sourceMessageId: input.messageId, kind: "changeset", title: changeSet.title, text: decision.text, status: "active", changeSetId: changeSet.id, createdAt: now, updatedAt: now };
+      let changeSet: ChangeSet | undefined;
+      let changeSetText = decision.text;
+      try {
+        changeSet = await propose(decision);
+      } catch (error) {
+        if (!(error instanceof ChangeSetValidationError)) throw error;
+        if (this.#steward.repair) {
+          let repaired: HarnessIntent | undefined;
+          try {
+            repaired = await this.#steward.repair(planInput, diagnostics, decision, (phase) => input.onProgress?.(phase));
+          } catch { repaired = undefined; }
+          if (repaired?.kind === "changeset") {
+            try { changeSet = await propose(repaired); changeSetText = repaired.text; }
+            catch (repairError) { if (!(repairError instanceof ChangeSetValidationError)) throw repairError; changeSet = undefined; }
+          } else if (repaired?.kind === "clarification") {
+            return this.#recordClarification(input, correlationId, received.event.eventId, repaired.text, "ChangeSet validation requires clarification", diagnostics);
+          }
+        }
+      }
+      if (!changeSet) {
+        return this.#recordClarification(input, correlationId, received.event.eventId, "这组变更还不能安全应用。请补充要创建或修改的对象，以及它与现有 Worker、Flow 或 Workspace 的关系。", "ChangeSet validation failed after one repair attempt", diagnostics);
+      }
+      const now = this.#now();
+      const block: ConversationBlock = { id: `block_${ulid()}`, conversationId: input.conversationId, sourceMessageId: input.messageId, kind: "changeset", title: changeSet.title, text: changeSetText, status: "active", changeSetId: changeSet.id, createdAt: now, updatedAt: now };
       this.#recordConversationBlock(block, correlationId, received.event.eventId);
       return { kind: "changeset", changeSet, block, replayed: false };
     }
@@ -635,7 +661,6 @@ export class ApplicationService {
         }
       }
     }
-    this.#applySystemGraphOperations(operations, `flow-graph:${flow.id}:${flow.version}:${flow.updatedAt}`, this.#config.stewardActorId);
     return this.#append({
       eventType: "FlowDefinitionEvent",
       aggregateType: "work",
@@ -644,7 +669,7 @@ export class ApplicationService {
       correlationId: `flow:${flow.id}`,
       causationId: null,
       idempotencyKey: `flow-definition:${flow.id}:${flow.version}:${flow.updatedAt}`,
-      payload: { flow },
+      payload: { flow, graphOperations: operations },
     }).projection;
   }
 

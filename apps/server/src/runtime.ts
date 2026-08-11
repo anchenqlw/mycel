@@ -9,7 +9,16 @@ import { ControlPlaneService } from "./control-plane.js";
 import type { ServerConfig } from "./config.js";
 import { ConnectionManager } from "./connections.js";
 import { IntentProgressHub } from "./intent-progress.js";
-import { GraphEdgeSchema, GraphNodeSchema, type ChangeOperation, type ControlCommand, type ControlResourceReference, type WeaveOperation, type WorkerProfile, type WorkerSpecVersion } from "@mycel/domain";
+import { type ChangeOperation, type ControlCommand, type ControlResourceReference, type WeaveOperation, type WorkerProfile, type WorkerSpecVersion } from "@mycel/domain";
+import {
+  materializeCreateFlow,
+  materializeUpdateFlow,
+  materializeGraphEdge,
+  materializeGraphNode,
+  resolveFlowTarget,
+  validateMaterializableChange,
+  type ChangeMaterializationContext,
+} from "./change-operation-materializer.js";
 
 export interface MycelRuntime {
   application: ApplicationService;
@@ -101,7 +110,8 @@ export async function createRuntime(config: ServerConfig): Promise<MycelRuntime>
 function controlHandlers(control: ControlPlaneService, tasks: TaskService, files: WorkspaceFilesService): ControlPlaneHandlers {
   return {
     executeCommand: async (command) => executeControlCommand(command, control, tasks, files),
-    applyChange: async (operation, changeSet, appliedResults) => applyControlChange(operation, changeSet.id, appliedResults, control, tasks),
+    validateChange: async (operation, changeSet) => validateMaterializableChange(operation, await materializationContext(changeSet.id, control, files, changeSet.operations), changeSet.operations),
+    applyChange: async (operation, changeSet, appliedResults) => applyControlChange(operation, changeSet, appliedResults, control, tasks, files),
     resolveResource: async (resource) => resolveHostResource(resource, files),
   };
 }
@@ -156,26 +166,27 @@ async function executeControlCommand(command: ControlCommand, control: ControlPl
   }
 }
 
-async function applyControlChange(operation: ChangeOperation, changeSetId: string, appliedResults: Readonly<Record<string, unknown>>, control: ControlPlaneService, tasks: TaskService): Promise<unknown> {
+async function applyControlChange(operation: ChangeOperation, changeSet: Parameters<NonNullable<ControlPlaneHandlers["applyChange"]>>[1], appliedResults: Readonly<Record<string, unknown>>, control: ControlPlaneService, tasks: TaskService, files: WorkspaceFilesService): Promise<unknown> {
   const actorId = "agent:steward";
+  const changeSetId = changeSet.id;
   const idempotencyKey = `change:${changeSetId}:${operation.id}`;
+  const context = await materializationContext(changeSetId, control, files, changeSet.operations, appliedResults);
   switch (operation.kind) {
     case "create-worker": return control.createNativeWorker(operation.payload as unknown as Parameters<ControlPlaneService["createNativeWorker"]>[0]);
     case "update-worker": return control.updateWorker(operation.targetId ?? requiredString(operation.payload.workerId, "workerId"), (operation.payload.patch ?? operation.payload) as Parameters<ControlPlaneService["updateWorker"]>[1]);
     case "archive-worker": return control.archiveWorker(operation.targetId ?? requiredString(operation.payload.workerId, "workerId"));
     case "publish-worker-spec": return control.publishWorkerSpec(resolveResourceId(operation.targetId ?? operation.payload.workerId ?? operation.payload.workerRef, appliedResults, "workerId"), (operation.payload.spec ?? operation.payload) as unknown as Omit<WorkerSpecVersion, "schemaVersion" | "id" | "workerId" | "version" | "createdAt">);
-    case "create-flow":
-    case "update-flow": return control.saveFlow((operation.payload.flow ?? operation.payload) as unknown as Parameters<ControlPlaneService["saveFlow"]>[0]);
-    case "publish-flow": return control.flowEngine.publish(operation.targetId ?? requiredString(operation.payload.flowId, "flowId"));
+    case "create-flow": return control.saveFlow(materializeCreateFlow(operation, context));
+    case "update-flow": return control.saveFlow(materializeUpdateFlow(operation, context));
+    case "publish-flow": return control.flowEngine.publish(resolveFlowTarget(operation, appliedResults));
     case "archive-flow": return control.flowEngine.pause(operation.targetId ?? requiredString(operation.payload.flowId, "flowId"));
     case "create-task": return tasks.create(operation.payload as unknown as Parameters<TaskService["create"]>[0], { actorId, idempotencyKey });
     case "update-task": return tasks.updateDefinition(operation.targetId ?? requiredString(operation.payload.taskId, "taskId"), (operation.payload.patch ?? operation.payload) as Parameters<TaskService["updateDefinition"]>[1], { actorId, idempotencyKey, ...(operation.expectedVersion ? { expectedVersion: operation.expectedVersion } : {}) });
-    case "create-graph-node": return applyGraphOperation(control, graphNodeOperation(operation), idempotencyKey, actorId);
+    case "create-graph-node": return applyGraphOperation(control, graphNodeOperation(operation, context), idempotencyKey, actorId);
     case "update-graph-node": return applyGraphOperation(control, { operationId: operation.id, op: "update_node", explanation: operationExplanation(operation), nodeId: operation.targetId ?? requiredString(operation.payload.nodeId, "nodeId"), patch: (operation.payload.patch ?? operation.payload) as Record<string, unknown> }, idempotencyKey, actorId);
     case "archive-graph-node": return applyGraphOperation(control, { operationId: operation.id, op: "update_node", explanation: operationExplanation(operation), nodeId: operation.targetId ?? requiredString(operation.payload.nodeId, "nodeId"), patch: { archivedAt: new Date().toISOString() } }, idempotencyKey, actorId);
     case "create-graph-edge": {
-      const edgeInput = (operation.payload.edge ?? operation.payload) as Record<string, unknown>;
-      const edge = GraphEdgeSchema.parse({ ...edgeInput, id: optionalString(edgeInput.id) ?? `edge:changeset:${changeSetId}:${operation.id}`, from: resolveResourceId(edgeInput.from ?? edgeInput.fromRef, appliedResults, "from"), to: resolveResourceId(edgeInput.to ?? edgeInput.toRef, appliedResults, "to") });
+      const edge = materializeGraphEdge(operation, context, appliedResults);
       const existing = control.getProjection().graph.edges.find((candidate) => candidate.id === edge.id || (candidate.type === edge.type && candidate.from === edge.from && candidate.to === edge.to && candidate.role === edge.role && candidate.permission === edge.permission));
       return existing ?? applyGraphOperation(control, { operationId: operation.id, op: "add_edge", explanation: operationExplanation(operation), edge }, idempotencyKey, actorId);
     }
@@ -189,13 +200,58 @@ async function applyControlChange(operation: ChangeOperation, changeSetId: strin
   }
 }
 
-function graphNodeOperation(operation: ChangeOperation): WeaveOperation {
-  const node = GraphNodeSchema.parse(operation.payload.node ?? operation.payload);
+function graphNodeOperation(operation: ChangeOperation, context: ChangeMaterializationContext): WeaveOperation {
+  const node = materializeGraphNode(operation, context);
   return { operationId: operation.id, op: "add_node", explanation: operationExplanation(operation), node };
 }
 
+async function materializationContext(
+  changeSetId: string,
+  control: ControlPlaneService,
+  files: WorkspaceFilesService,
+  operations: readonly ChangeOperation[] = [],
+  appliedResults: Readonly<Record<string, unknown>> = {},
+): Promise<ChangeMaterializationContext> {
+  const actors = new Map<string, { id: string; kind: "human" | "agent" }>();
+  for (const node of control.getProjection().graph.nodes) {
+    if (node.type !== "actor") continue;
+    const actor = { id: node.id, kind: node.kind };
+    actors.set(node.id, actor);
+  }
+  for (const worker of Object.values(control.getProjection().workers)) {
+    const actor = { id: worker.id, kind: "agent" as const };
+    actors.set(worker.id, actor);
+  }
+  for (const operation of operations) {
+    if (operation.kind !== "create-worker") continue;
+    const pending = { id: `pending:${operation.id}`, kind: "agent" as const };
+    actors.set(operation.id, pending);
+  }
+  for (const [operationId, value] of Object.entries(appliedResults)) {
+    if (typeof value !== "object" || value === null || !("id" in value) || typeof value.id !== "string") continue;
+    const sourceOperation = operations.find((candidate) => candidate.id === operationId);
+    if (sourceOperation?.kind !== "create-worker") continue;
+    const actor = { id: value.id, kind: "agent" as const };
+    actors.set(operationId, actor);
+  }
+
+  const workspaces = new Map<string, string>();
+  for (const workspace of await files.registry.list()) {
+    workspaces.set(workspace.id, workspace.id);
+  }
+  const flows = new Map(control.flowEngine.list().map((flow) => [flow.id, flow]));
+  const graphNodeIds = new Set(control.getProjection().graph.nodes.map((node) => node.id));
+  return { changeSetId, now: new Date().toISOString(), actors, workspaces, flows, graphNodeIds };
+}
+
 function applyGraphOperation(control: ControlPlaneService, operation: WeaveOperation, idempotencyKey: string, actorId: string): unknown {
-  return control.applyGraphOperations([operation], idempotencyKey, actorId).graph;
+  const graph = control.applyGraphOperations([operation], idempotencyKey, actorId).graph;
+  switch (operation.op) {
+    case "add_node": return graph.nodes.find((node) => node.id === operation.node.id) ?? operation.node;
+    case "update_node": return graph.nodes.find((node) => node.id === operation.nodeId) ?? { id: operation.nodeId };
+    case "add_edge": return graph.edges.find((edge) => edge.id === operation.edge.id) ?? operation.edge;
+    case "remove_edge": return { id: operation.edgeId, removed: true };
+  }
 }
 
 function resolveResourceId(value: unknown, appliedResults: Readonly<Record<string, unknown>>, name: string): string {

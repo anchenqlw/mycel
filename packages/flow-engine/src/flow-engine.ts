@@ -5,6 +5,7 @@ import type {
   FlowDefinition,
   FlowRun,
   FlowStepDefinition,
+  FlowTrigger,
   HumanTask,
   PermissionLease,
   PermissionRequest,
@@ -17,6 +18,85 @@ import { ulid } from "ulid";
 const DEFAULT_MAX_CONCURRENCY = 4;
 const DEFAULT_MAX_RUNTIME_MS = 30 * 60_000;
 const DEFAULT_MAX_TOTAL_ATTEMPTS = 100;
+const MAX_TIMER_DELAY_MS = 2_147_483_647;
+const DAILY_WALL_CLOCK_INTERVAL_MS = 86_400_000;
+
+type ScheduleTrigger = Extract<FlowTrigger, { kind: "schedule" }>;
+
+export function nextScheduleOccurrence(trigger: ScheduleTrigger, after: Date): Date {
+  if (!Number.isFinite(after.getTime())) throw new Error("schedule reference time is invalid");
+  if (!trigger.timeOfDay || !/^([01]\d|2[0-3]):[0-5]\d$/.test(trigger.timeOfDay)) throw new Error("schedule timeOfDay must use HH:mm");
+  if (!trigger.timezone) throw new Error("schedule timezone is required with timeOfDay");
+  assertTimezone(trigger.timezone);
+  if (trigger.intervalMs !== DAILY_WALL_CLOCK_INTERVAL_MS) throw new Error("wall-clock schedules currently require a daily interval");
+  const [hour, minute] = trigger.timeOfDay.split(":").map(Number) as [number, number];
+  const local = zonedParts(after, trigger.timezone);
+  for (let dayOffset = 0; dayOffset <= 8; dayOffset += 1) {
+    const date = new Date(Date.UTC(local.year, local.month - 1, local.day + dayOffset));
+    let candidate: Date;
+    try {
+      candidate = zonedDateTimeToUtc({
+        year: date.getUTCFullYear(),
+        month: date.getUTCMonth() + 1,
+        day: date.getUTCDate(),
+        hour,
+        minute,
+      }, trigger.timezone);
+    } catch {
+      continue;
+    }
+    if (candidate.getTime() > after.getTime()) return candidate;
+  }
+  throw new Error("schedule next occurrence could not be calculated");
+}
+
+interface ZonedDateParts {
+  year: number;
+  month: number;
+  day: number;
+  hour: number;
+  minute: number;
+}
+
+function assertTimezone(timezone: string): void {
+  try {
+    new Intl.DateTimeFormat("en-CA", { timeZone: timezone }).format(new Date(0));
+  } catch {
+    throw new Error("schedule timezone must be a valid IANA timezone");
+  }
+}
+
+function zonedParts(date: Date, timezone: string): ZonedDateParts {
+  const parts = new Intl.DateTimeFormat("en-CA", {
+    timeZone: timezone,
+    year: "numeric",
+    month: "2-digit",
+    day: "2-digit",
+    hour: "2-digit",
+    minute: "2-digit",
+    hourCycle: "h23",
+  }).formatToParts(date);
+  const value = (type: Intl.DateTimeFormatPartTypes) => Number(parts.find((part) => part.type === type)?.value);
+  return { year: value("year"), month: value("month"), day: value("day"), hour: value("hour"), minute: value("minute") };
+}
+
+function zonedDateTimeToUtc(target: ZonedDateParts, timezone: string): Date {
+  const desired = Date.UTC(target.year, target.month - 1, target.day, target.hour, target.minute);
+  let guess = desired;
+  for (let iteration = 0; iteration < 4; iteration += 1) {
+    const actual = zonedParts(new Date(guess), timezone);
+    const represented = Date.UTC(actual.year, actual.month - 1, actual.day, actual.hour, actual.minute);
+    const correction = desired - represented;
+    if (correction === 0) break;
+    guess += correction;
+  }
+  const candidate = new Date(guess);
+  const actual = zonedParts(candidate, timezone);
+  if (actual.year !== target.year || actual.month !== target.month || actual.day !== target.day || actual.hour !== target.hour || actual.minute !== target.minute) {
+    throw new Error("schedule timeOfDay does not exist in the selected timezone on that date");
+  }
+  return candidate;
+}
 
 export interface RestoredFlowRuntime {
   runs: FlowRun[];
@@ -130,9 +210,9 @@ export class LocalFlowEngine {
       createdAt: previous?.createdAt ?? input.createdAt ?? now,
       updatedAt: now,
     };
+    await this.#port.persistDefinition(flow);
     this.#flows.set(flow.id, flow);
     this.#schedule(flow);
-    await this.#port.persistDefinition(flow);
     return flow;
   }
 
@@ -431,7 +511,7 @@ export class LocalFlowEngine {
   }
 
   stop(): void {
-    for (const timer of this.#timers.values()) clearInterval(timer);
+    for (const timer of this.#timers.values()) clearTimeout(timer);
     this.#timers.clear();
   }
 
@@ -765,9 +845,29 @@ export class LocalFlowEngine {
 
   #schedule(flow: FlowDefinition): void {
     const existing = this.#timers.get(flow.id);
-    if (existing) clearInterval(existing);
+    if (existing) clearTimeout(existing);
     this.#timers.delete(flow.id);
     if (flow.status !== "published" || flow.trigger.kind !== "schedule") return;
+    if (flow.trigger.timeOfDay || flow.trigger.timezone) {
+      const target = nextScheduleOccurrence(flow.trigger, this.#clock.now());
+      const fullDelay = Math.max(1, target.getTime() - this.#clock.now().getTime());
+      const delay = Math.min(fullDelay, MAX_TIMER_DELAY_MS);
+      const timer = setTimeout(() => {
+        this.#timers.delete(flow.id);
+        if (fullDelay > MAX_TIMER_DELAY_MS) {
+          const current = this.#flows.get(flow.id);
+          if (current?.updatedAt === flow.updatedAt) this.#schedule(current);
+          return;
+        }
+        void this.trigger(flow.id, "schedule").catch(() => undefined).finally(() => {
+          const current = this.#flows.get(flow.id);
+          if (current?.updatedAt === flow.updatedAt) this.#schedule(current);
+        });
+      }, delay);
+      timer.unref();
+      this.#timers.set(flow.id, timer);
+      return;
+    }
     const timer = setInterval(() => { void this.trigger(flow.id, "schedule"); }, flow.trigger.intervalMs);
     timer.unref();
     this.#timers.set(flow.id, timer);
@@ -892,7 +992,11 @@ function validateFlow(input: Pick<FlowDefinition, "steps" | "trigger" | "maxConc
     }
   }
   if (hasCycle(input.steps)) throw new Error("flow graph must be acyclic");
-  if (input.trigger.kind === "schedule" && input.trigger.intervalMs < 10_000) throw new Error("schedule interval must be at least 10 seconds");
+  if (input.trigger.kind === "schedule") {
+    if (input.trigger.intervalMs < 10_000) throw new Error("schedule interval must be at least 10 seconds");
+    if (Boolean(input.trigger.timeOfDay) !== Boolean(input.trigger.timezone)) throw new Error("schedule timeOfDay and timezone must be provided together");
+    if (input.trigger.timeOfDay) nextScheduleOccurrence(input.trigger, new Date(0));
+  }
 }
 
 function hasCycle(steps: FlowStepDefinition[]): boolean {

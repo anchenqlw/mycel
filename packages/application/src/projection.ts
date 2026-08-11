@@ -317,7 +317,8 @@ export function reduceProjection(current: Readonly<AppProjection>, event: EventE
       break;
     }
     case "FlowDefinitionEvent": {
-      const payload = event.payload as { flow: FlowDefinition };
+      const payload = event.payload as { flow: FlowDefinition; graphOperations?: WeaveOperation[] };
+      if (payload.graphOperations?.length) projection.graph = applyOperations(projection.graph, payload.graphOperations, event.occurredAt);
       projection.flows[payload.flow.id] = payload.flow;
       break;
     }
